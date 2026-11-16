@@ -212,7 +212,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             return True
         if isinstance(msg, LwdC2eNotify):
             connection_id = self._lwd_connection_of(peer)
-            lwd_logger.info(
+            # One per decode step per engine on the control-plane IO thread,
+            # which shares the GIL with the only scheduling thread: debug,
+            # not info.
+            lwd_logger.debug(
                 "[edge] c2e received from %s reqs=%d hidden_numel=%d",
                 connection_id,
                 len(msg.req_ids),
