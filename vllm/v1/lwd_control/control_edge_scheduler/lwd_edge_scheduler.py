@@ -135,7 +135,18 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_route: dict[str, LwdConnectionId] = {}
         """Request id -> full connection, pinned at admission."""
         self._lwd_last_engine = -1
-        """Round-robin anchor shared by routing and engine picking."""
+        """Round-robin anchor shared by routing and engine picking; advanced
+        only by the step that serves a connection, never by a liveness
+        query."""
+        # max_num_seqs is one cloud DP's seat count (the handshake rejects a
+        # mismatch), so the edge serves that many per connection and this
+        # product is the concurrency the deployment actually offers.
+        lwd_logger.info(
+            "[edge-sched] seats: %d per connection x %d connections = %d",
+            self.max_num_running_reqs,
+            len(connections),
+            self.max_num_running_reqs * len(connections),
+        )
         # Prefix caching: manager-level hits must stay off (the edge holds
         # no KV cache -- a hit would skip embedding blocks never written);
         # the config-level flag stays on so the engine still builds the
@@ -251,12 +262,25 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     # ------------------------------------------------------------- stepping
 
     def has_requests(self) -> bool:
-        """Keep stepping while any UP send still needs watermark settlement.
+        """Whether this step has anything to do; False parks the engine on
+        its input queue.
 
-        A full pending gate stops new EMBED batches, but the empty UNEMBED
-        step still executes the worker and harvests completed sends. Without
-        this predicate the edge can sleep forever with pending sends that no
-        later batch can clear.
+        Keep stepping while any UP send still needs watermark settlement: a
+        full pending gate stops new EMBED batches, but the empty UNEMBED
+        step still executes the worker and harvests completed sends, and
+        without that term the edge sleeps holding sends no later batch can
+        clear.
+
+        Every term is one an event can clear while parked: requests arrive
+        on the input queue, and the control plane posts a WAKEUP for c2e,
+        prefix-ready and refill notifies
+        (`LwdEdgeEngineCore._lwd_dispatch_message`). A term no such event
+        follows would park the edge for good -- which is why
+        dispatchability asks for prefill work rather than for routed
+        requests: a connection whose requests have all sent their prompts
+        keeps the latter true in every decode steady state, and the edge
+        then runs a worker round trip per step producing nothing, competing
+        with the control-plane IO thread for the GIL.
         """
         return (
             bool(self.unembed_notify_queue)
@@ -280,28 +304,41 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return out
         return self._lwd_schedule_unembed()
 
-    def _lwd_pick_serving_engine(self) -> LwdConnectionId | None:
-        """Pick the next ungated connection with routed work in stable order."""
-        routed = set(self._lwd_route.values())
-        if not routed:
-            return None
+    def _lwd_servable_connection(self) -> tuple[int, LwdConnectionId] | None:
+        """The connection this step would serve, with its rotation index.
+
+        Pure by contract: the liveness predicate calls this on every step,
+        so advancing the rotation anchor or logging a gate transition here
+        would make a query indistinguishable from a dispatch -- the
+        rotation would skip connections nobody served and the log would
+        flip on every step. Both belong to the dispatching caller.
+        """
         connections = self._lwd_connections
         for offset in range(len(connections)):
             index = (self._lwd_last_engine + 1 + offset) % len(connections)
             connection_id = connections[index]
-            if connection_id not in routed:
+            if not self._lwd_has_prefill_work(connection_id):
                 continue
-            account = self._lwd_accounts[connection_id]
-            if account.is_gated(
+            if self._lwd_accounts[connection_id].is_gated(
                 self.max_num_running_reqs,
                 self._lwd_has_prefill_chunk_inflight(connection_id),
-                num_running_reqs=len(self.running),
+                num_running_reqs=self._lwd_running_on(connection_id),
             ):
-                self._lwd_log_gate_transition(account)
                 continue
-            self._lwd_last_engine = index
-            return connection_id
+            return index, connection_id
         return None
+
+    def _lwd_take_servable_connection(self) -> LwdConnectionId | None:
+        """`_lwd_servable_connection` for the step that actually serves it:
+        advances the rotation anchor and reports the gate transitions."""
+        servable = self._lwd_servable_connection()
+        for connection_id, account in self._lwd_accounts.items():
+            if self._lwd_has_prefill_work(connection_id):
+                self._lwd_log_gate_transition(account)
+        if servable is None:
+            return None
+        self._lwd_last_engine, connection_id = servable
+        return connection_id
 
     def _lwd_log_gate_transition(self, account: LwdCloudDpAccount) -> None:
         held = account.pending_chunks() >= account.max_pending_chunks
@@ -315,9 +352,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
 
     def _lwd_embed_dispatchable(self) -> bool:
-        """EMBED dispatchability: some engine has routed work and passes its
-        gate."""
-        return self._lwd_pick_serving_engine() is not None
+        """EMBED dispatchability: some connection holds prefill work and
+        passes its gate."""
+        return self._lwd_servable_connection() is not None
 
     def _lwd_schedule_embed(self) -> SchedulerOutput | None:
         """Chunked batch + budget clamp + RangeNotify of one engine, then
@@ -328,7 +365,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         advanced num_computed_tokens, so a dropped chunk would never be
         embedded and the next offset would not match the cloud. A notify
         that cannot be sent raises instead."""
-        dp_idx = self._lwd_pick_serving_engine()
+        dp_idx = self._lwd_take_servable_connection()
         if dp_idx is None:
             return self._lwd_schedule_abort_notice()
         out = self._lwd_schedule_batch(dp_idx)
@@ -566,9 +603,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             self.max_num_scheduled_tokens
             - account.decode_load * account.num_speculative_tokens,
         )
-        # Native edge slots are shared across DP routes. Waiting requests
-        # contribute routing load, but must not reserve slots before admission.
-        free_seq = self.max_num_running_reqs - len(self.running)
+        # Seats of the cloud DP this batch goes to. Waiting requests
+        # contribute routing load, but must not reserve seats before
+        # admission, so the count is the native running queue -- restricted
+        # to this connection, which is what max_num_running_reqs sizes.
+        free_seq = self.max_num_running_reqs - self._lwd_running_on(dp_idx)
         # Resume candidates take only the prefill phase (decode-phase
         # residents have remaining=0, which the picker would skip anyway;
         # after the filter, a non-empty candidate list is itself the resume
@@ -609,9 +648,22 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         """Chunk batch assembly: the picker selects the batch of one engine,
         scheduled via the base-class visible-set mechanism (budget clamped
         to that engine's cap; the chunk split is guaranteed by the clamping
-        parameters to be reproduced natively)."""
+        parameters to be reproduced natively).
+
+        Only this connection's hidden requests are charged against the seat
+        budget, for the reason `_lwd_running_on` gives: the siblings' seats
+        belong to other cloud DPs."""
         req_ids, _expected, cap = self._lwd_pick_prefill_batch(dp_idx)
-        return self._lwd_schedule(req_ids, token_budget_cap=cap)
+        picked = set(req_ids)
+        hidden_seats = sum(
+            1
+            for request in self.running
+            if request.request_id not in picked
+            and self._lwd_route.get(request.request_id) == dp_idx
+        )
+        return self._lwd_schedule(
+            req_ids, token_budget_cap=cap, hidden_seats=hidden_seats
+        )
 
     def _try_schedule_encoder_inputs(
         self,
@@ -625,6 +677,38 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         by the worker itself; native rollback would break the chunk
         contract, so nothing is scheduled, consumed, or rolled back."""
         return [], num_new_tokens, encoder_compute_budget, []
+
+    def _lwd_running_on(self, dp_idx: LwdConnectionId) -> int:
+        """Native running requests routed to one connection.
+
+        The seat unit is one cloud DP, not the whole edge: each connection
+        serves a cloud DP with its own `max_num_seqs`, and the handshake
+        makes the edge's value that single DP's. Counting the whole running
+        queue would stop admission once the fleet total reached one DP's
+        cap, running an N-DP cloud at 1/N of its concurrency.
+        """
+        return sum(
+            1
+            for request in self.running
+            if self._lwd_route.get(request.request_id) == dp_idx
+        )
+
+    def _lwd_has_prefill_work(self, dp_idx: LwdConnectionId) -> bool:
+        """Whether this connection holds prefill the picker could batch.
+
+        Same two sources as `_lwd_pick_prefill_batch`: a resume still in
+        running, or a queued request routed here. A routed request that
+        already sent its whole prompt is not edge work -- only the cloud
+        advances it -- so a connection holding nothing else is the normal
+        decode steady state, and stepping for it produces nothing.
+        """
+        if self._lwd_has_prefill_chunk_inflight(dp_idx):
+            return True
+        return any(
+            self._lwd_route.get(request.request_id) == dp_idx
+            for queue in (self.skipped_waiting, self.waiting)
+            for request in queue
+        )
 
     def _lwd_has_prefill_chunk_inflight(self, dp_idx: LwdConnectionId) -> bool:
         """Whether dp_idx has an embed request not fully sent; same
