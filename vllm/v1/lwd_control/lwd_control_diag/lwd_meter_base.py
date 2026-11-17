@@ -36,7 +36,7 @@ lwd_meter_logger = init_logger("vllm.lwd_meter")
 
 # One line per meter per interval. Long enough that a loaded second
 # cannot flood the log, short enough to see a phase change within a run.
-LWD_METER_INTERVAL_S = 10.0
+LWD_METER_INTERVAL_S = 300.0
 
 
 class LwdIntervalMeter:

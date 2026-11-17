@@ -119,6 +119,7 @@ class LwdBatchShape:
     blocked_no_arrival: int = 0
     running: int = 0
     waiting: int = 0
+    output_tokens: int = 0
 
     def __str__(self) -> str:
         return (
@@ -188,6 +189,41 @@ class LwdStepTiming:
         return self.total() - self.pre_gap
 
 
+class LwdShapeWindow:
+    """Aggregates for one non-empty scheduler batch shape."""
+
+    def __init__(self) -> None:
+        self.steps = 0
+        self.total = LwdSpan()
+        self.model_wait = LwdSpan()
+        self.model_s = 0.0
+        self.prefill_tokens = 0
+        self.output_tokens = 0
+
+    def note(self, timing: LwdStepTiming) -> None:
+        self.steps += 1
+        self.total.add(timing.in_step())
+        model_s = timing.sample_rpc or 0.0
+        self.model_wait.add(model_s)
+        self.model_s += model_s
+        self.prefill_tokens += timing.shape.prefill_tokens
+        self.output_tokens += timing.shape.output_tokens
+
+    def summary(self, all_model_s: float) -> str:
+        ms_per_token = (
+            f"{self.model_s * 1000 / self.output_tokens:.2f}"
+            if self.output_tokens
+            else "-"
+        )
+        share = self.model_s / all_model_s * 100 if all_model_s else 0.0
+        return (
+            f"steps={self.steps} prefill={self.prefill_tokens} "
+            f"output={self.output_tokens} total={self.total} "
+            f"model={self.model_wait} model_ms/token={ms_per_token} "
+            f"model_share={share:.1f}%"
+        )
+
+
 class LwdCloudExecMeter(LwdIntervalMeter):
     """Per-step breakdown of the cloud engine's loop.
 
@@ -216,6 +252,10 @@ class LwdCloudExecMeter(LwdIntervalMeter):
         # boundary belongs to one of the two windows, and dropping it
         # would drop the long ones first.
         self._steps = 0
+        self._empty = 0
+        self._shapes = {
+            kind: LwdShapeWindow() for kind in ("mixed", "decode_only", "prefill_only")
+        }
         self._slow = 0
         self._retries = 0
         self._total = LwdSpan()
@@ -247,11 +287,28 @@ class LwdCloudExecMeter(LwdIntervalMeter):
             self._wait_label,
         )
 
+    @staticmethod
+    def _kind(timing: LwdStepTiming) -> str:
+        shape = timing.shape
+        has_prefill = bool(shape.prefill_tokens or shape.prefill_windows)
+        has_decode = bool(shape.decode_tokens)
+        if has_prefill:
+            return "mixed" if has_decode else "prefill_only"
+        if has_decode or shape.output_tokens:
+            return "decode_only"
+        return "empty"
+
     def note_step(self, timing: LwdStepTiming) -> None:
         """One trip through the engine's step."""
         if timing.pre_gap >= LWD_IDLE_GAP_S:
             self._note_idle(timing.pre_gap)
             timing.pre_gap = 0.0
+        kind = self._kind(timing)
+        if kind == "empty":
+            self._empty += 1
+            self._roll()
+            return
+        self._shapes[kind].note(timing)
         self._steps += 1
         self._retries += timing.c2e_retries
         self._total.add(timing.in_step())
@@ -341,6 +398,16 @@ class LwdCloudExecMeter(LwdIntervalMeter):
             time.time(),
         )
 
+    def _report_shapes(self) -> None:
+        all_model_s = sum(window.model_s for window in self._shapes.values())
+        shapes = "; ".join(
+            f"{kind}[{window.summary(all_model_s)}]"
+            for kind, window in self._shapes.items()
+            if window.steps
+        )
+        if shapes:
+            logger.info("[lwd][cloud-shape] %s", shapes)
+
     def _report(self) -> None:
         if not self._steps:
             return
@@ -368,6 +435,7 @@ class LwdCloudExecMeter(LwdIntervalMeter):
             self._native_post,
             self._retries,
         )
+        self._report_shapes()
 
 
 # A harvest worth naming individually. An order of magnitude under the
@@ -458,9 +526,7 @@ class LwdCloudOutputMeter(LwdIntervalMeter):
             self._harvests += 1
             self._rows += max(0, record.hidden_numel)
             self._harvest.add(record.harvest_s)
-            self._total.add(
-                record.harvest_s + record.output_get_s + record.enqueue_s
-            )
+            self._total.add(record.harvest_s + record.output_get_s + record.enqueue_s)
             if record.harvest_s >= LWD_SLOW_OUTPUT_S:
                 logger.info(
                     "[lwd][cloud-output-slow] rank%d %.0fms harvest: "

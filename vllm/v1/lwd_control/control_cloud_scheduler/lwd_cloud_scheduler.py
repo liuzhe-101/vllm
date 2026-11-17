@@ -594,6 +594,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 num_tokens += len(out.new_token_ids)
                 self.lwd_ttft_meter.note_first_token(out.request_id)
         self._lwd_step_meter.note_step(committed, num_tokens)
+        self._lwd_timing.shape.output_tokens = num_tokens
         self.lwd_ttft_meter.tick()
 
     def _lwd_cleanup_arrivals(
