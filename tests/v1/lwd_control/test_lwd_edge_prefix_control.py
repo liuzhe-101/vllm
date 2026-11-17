@@ -12,6 +12,7 @@ import msgspec
 import pytest
 
 from vllm.v1.engine import EngineCoreRequestType, FinishReason
+from vllm.v1.lwd_control.lwd_model.lwd_model_family import LwdModelFamily
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_cloud_dp_account import (
     LwdCloudDpAccount,
 )
@@ -159,7 +160,7 @@ def _refill_scheduler(send: Mock) -> LwdEdgeScheduler:
     scheduler._lwd_route = {"r": 1}
     scheduler._lwd_pending_refills = deque()
     scheduler._lwd_announced_refills = set()
-    scheduler._lwd_mrope_positions_dict = {}
+    scheduler.lwd_model_family = LwdModelFamily()
     scheduler._lwd_aborted_req_ids = {0: [], 1: []}
     scheduler._lwd_chunk_unit = 4
     scheduler.scheduler_config = SimpleNamespace(max_num_batched_tokens=3)

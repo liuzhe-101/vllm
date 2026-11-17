@@ -13,6 +13,7 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
     LwdEdgeScheduler,
 )
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import LwdBaseEngineCore
+from vllm.v1.lwd_control.lwd_model.lwd_model_family import LwdMropeModelFamily
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LWD_SAMPLING_DEFAULTS,
     LwdAbortNotify,
@@ -25,7 +26,8 @@ def _scheduler() -> LwdEdgeScheduler:
     scheduler._lwd_accounts = (LwdCloudDpAccount(0), LwdCloudDpAccount(1))
     scheduler._lwd_aborted_req_ids = {0: [], 1: []}
     scheduler._lwd_route = {}
-    scheduler._lwd_mrope_positions_dict = {}
+    scheduler.lwd_model_family = object.__new__(LwdMropeModelFamily)
+    scheduler.lwd_model_family._positions = {}
     scheduler.unembed_notify_queue = ()
     scheduler.requests = {}
     return scheduler
@@ -113,7 +115,7 @@ def test_range_leaves_mrope_bytes_empty_and_full_prompt_is_read_only() -> None:
             return b"full-prompt"
 
     scheduler = _scheduler()
-    scheduler._lwd_mrope_positions_dict["r1"] = Positions()
+    scheduler.lwd_model_family._positions["r1"] = Positions()
     scheduler.requests["r1"] = SimpleNamespace(
         num_computed_tokens=5,
         prompt_token_ids=[0, 1, 2, 3, 4],
