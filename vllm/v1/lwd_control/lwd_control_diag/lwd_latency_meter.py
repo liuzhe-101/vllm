@@ -128,6 +128,40 @@ class LwdCloudStepTiming:
         return self.wall + self.dummy + self.dp_sync
 
 
+class LwdShapeWindow:
+    """Aggregates for one non-empty scheduler batch shape."""
+
+    def __init__(self) -> None:
+        self.steps = 0
+        self.total = LwdSpan()
+        self.model_wait = LwdSpan()
+        self.model_s = 0.0
+        self.prefill_tokens = 0
+        self.output_tokens = 0
+
+    def note(self, timing: LwdCloudStepTiming) -> None:
+        self.steps += 1
+        self.total.add(timing.total)
+        self.model_wait.add(timing.model_wait)
+        self.model_s += timing.model_wait
+        self.prefill_tokens += timing.shape.prefill_tokens
+        self.output_tokens += timing.shape.output_tokens
+
+    def summary(self, all_model_s: float) -> str:
+        ms_per_token = (
+            f"{self.model_s * 1000 / self.output_tokens:.2f}"
+            if self.output_tokens
+            else "-"
+        )
+        share = self.model_s / all_model_s * 100 if all_model_s else 0.0
+        return (
+            f"steps={self.steps} prefill={self.prefill_tokens} "
+            f"output={self.output_tokens} total={self.total} "
+            f"model={self.model_wait} model_ms/token={ms_per_token} "
+            f"model_share={share:.1f}%"
+        )
+
+
 class LwdCloudStepMeter(LwdIntervalMeter):
     """Break down engine wall time; average/max values are milliseconds."""
 
@@ -137,6 +171,10 @@ class LwdCloudStepMeter(LwdIntervalMeter):
 
     def _reset(self) -> None:
         self._steps = 0
+        self._empty = 0
+        self._shapes = {
+            kind: LwdShapeWindow() for kind in ("mixed", "decode_only", "prefill_only")
+        }
         self._slow = 0
         self._slow_examples: list[LwdCloudStepTiming] = []
         self._ranges = 0
@@ -170,7 +208,24 @@ class LwdCloudStepMeter(LwdIntervalMeter):
             return 0.0
         return time.monotonic() - self._last_step_end
 
+    @staticmethod
+    def _kind(timing: LwdCloudStepTiming) -> str:
+        shape = timing.shape
+        has_prefill = bool(shape.prefill_tokens or shape.window_tokens)
+        has_decode = bool(shape.decode_expected or shape.decode_tokens)
+        if has_prefill:
+            return "mixed" if has_decode else "prefill_only"
+        if has_decode or shape.output_tokens or timing.c2e_count:
+            return "decode_only"
+        return "empty"
+
     def note_step(self, timing: LwdCloudStepTiming) -> None:
+        kind = self._kind(timing)
+        if kind == "empty":
+            self._empty += 1
+            self._roll()
+            return
+        self._shapes[kind].note(timing)
         self._steps += 1
         values = {
             "total": timing.total,
@@ -193,26 +248,40 @@ class LwdCloudStepMeter(LwdIntervalMeter):
             del self._slow_examples[_MAX_SLOW_EXAMPLES:]
         self._roll()
 
-    def _report(self) -> None:
-        if not self._steps:
-            return
-        logger.info(
-            "[lwd][cloud-step] %d steps (%d slow): total=%s pre_gap=%s "
-            "dummy=%s dp_sync=%s sched=%s model_wait=%s update=%s "
-            "c2e_send=%s native_post=%s other=%s (avg/max ms)",
-            self._steps,
-            self._slow,
-            self._total,
-            self._pre_gap,
-            self._dummy,
-            self._dp_sync,
-            self._sched,
-            self._model_wait,
-            self._update,
-            self._c2e_send,
-            self._native_post,
-            self._other,
+    def _report_shapes(self) -> None:
+        all_model_s = sum(window.model_s for window in self._shapes.values())
+        shapes = "; ".join(
+            f"{kind}[{window.summary(all_model_s)}]"
+            for kind, window in self._shapes.items()
+            if window.steps
         )
+        if shapes:
+            logger.info("[lwd][cloud-shape] %s", shapes)
+
+    def _report(self) -> None:
+        if self._steps:
+            logger.info(
+                "[lwd][cloud-step] %d steps (%d slow, %d empty excluded): "
+                "total=%s pre_gap=%s dummy=%s dp_sync=%s sched=%s "
+                "model_wait=%s update=%s c2e_send=%s native_post=%s "
+                "other=%s (avg/max ms)",
+                self._steps,
+                self._slow,
+                self._empty,
+                self._total,
+                self._pre_gap,
+                self._dummy,
+                self._dp_sync,
+                self._sched,
+                self._model_wait,
+                self._update,
+                self._c2e_send,
+                self._native_post,
+                self._other,
+            )
+            self._report_shapes()
+        elif self._empty:
+            logger.info("[lwd][cloud-step] %d empty steps excluded", self._empty)
         if self._ranges:
             logger.info(
                 "[lwd][cloud-up] %d ranges ingest_wait=%s hint_post=%s (avg/max ms)",
