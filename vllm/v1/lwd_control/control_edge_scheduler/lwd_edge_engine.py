@@ -185,6 +185,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self._lwd_probe_manager.close()
         for client in getattr(self, "_lwd_coord_clients", {}).values():
             client.shutdown()
+        meter = getattr(self.scheduler, "_lwd_output_meter", None)
+        if meter is not None:
+            meter.flush()
         super().shutdown()
 
     def _lwd_decode(self, payload: bytes) -> LwdMessage:
@@ -221,7 +224,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 len(msg.req_ids),
                 msg.hidden_num_elements,
             )
-            self.scheduler.unembed_notify_queue.append((connection_id, msg))
+            self.scheduler.lwd_edge_note_c2e(connection_id, msg)
             self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
             return True
         return False

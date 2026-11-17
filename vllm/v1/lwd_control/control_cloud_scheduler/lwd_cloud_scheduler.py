@@ -14,6 +14,7 @@ the arrived-row high watermark is retained for readmission.
 from __future__ import annotations
 
 import itertools
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -41,6 +42,11 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdC2eNotify,
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
+from vllm.v1.lwd_control.lwd_control_diag.lwd_latency_meter import (
+    LwdBatchShape,
+    LwdCloudStepMeter,
+    LwdCloudStepTiming,
+)
 from vllm.v1.request import Request, RequestStatus
 
 if TYPE_CHECKING:
@@ -113,6 +119,9 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self._lwd_refill_gate: set[str] = set()
         self._lwd_refill_pending: dict[str, _LwdRefillPending] = {}
         self._lwd_diag = LwdControlDiag()
+        self.lwd_exec_meter = LwdCloudStepMeter()
+        self._lwd_timing = LwdCloudStepTiming()
+        self._lwd_step_shapes: dict[int, LwdBatchShape] = {}
         self.pending_c2e: list[LwdC2eNotify] = []
         self._lwd_prefill_group_cursor = 0
         self.lwd_finished_records: dict[str, tuple[int, int]] = {}
@@ -120,6 +129,18 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self.lwd_prefix_hits: dict[str, int] = {}
         self.lwd_refill_sender = None
         lwd_logger.info("[cloud-sched] arrival-driven prefill/decode scheduling")
+
+    def lwd_open_step(self, timing: LwdCloudStepTiming) -> None:
+        self._lwd_timing = timing
+
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        started = time.monotonic()
+        try:
+            return super().schedule(throttle_prefills)
+        finally:
+            timing = getattr(self, "_lwd_timing", None)
+            if timing is not None:
+                timing.sched += time.monotonic() - started
 
     def has_requests(self) -> bool:
         """Keep the engine alive until an abort-only worker notice is sent."""
@@ -139,7 +160,51 @@ class LwdCloudScheduler(LwdBaseScheduler):
             self._lwd_warn_under_scheduled(out, windows)
         self._lwd_attach_request_metadata(out)
         self._lwd_attach_abort_notice(out)
+        self._lwd_record_batch_shape(out, windows, room, decode_ids, decode_exact)
         return out
+
+    def _lwd_record_batch_shape(
+        self,
+        out: SchedulerOutput,
+        windows: list[_LwdPrefillWindow],
+        room: int,
+        decode_ids: list[str],
+        decode_exact: int,
+    ) -> None:
+        if not hasattr(self, "_lwd_step_shapes"):
+            return
+        window_ids = {window.request.request_id for window in windows}
+        first_prefill = next(
+            (
+                index
+                for index, request in enumerate(self.running)
+                if request.request_id in window_ids
+            ),
+            -1,
+        )
+        scheduled_prefill = [
+            out.num_scheduled_tokens.get(request_id, 0) for request_id in window_ids
+        ]
+        spec = self.vllm_config.speculative_config
+        shape = LwdBatchShape(
+            decode_reqs=len(decode_ids),
+            decode_expected=decode_exact,
+            decode_tokens=sum(
+                out.num_scheduled_tokens.get(rid, 0) for rid in decode_ids
+            ),
+            prefill_reqs=sum(rows > 0 for rows in scheduled_prefill),
+            prefill_tokens=sum(scheduled_prefill),
+            window_reqs=len(windows),
+            window_tokens=sum(window.num_rows for window in windows),
+            room=room,
+            running=len(self.running),
+            waiting=len(self.waiting) + len(self.skipped_waiting),
+            preempted=len(out.preempted_req_ids or ()),
+            first_prefill_index=first_prefill,
+            draft_slots=(spec.max_num_new_slots_for_drafting if spec else 0),
+        )
+        self._lwd_step_shapes[id(out)] = shape
+        self._lwd_timing.shape = shape
 
     def _lwd_collect_decode_requests(self) -> list[str]:
         return [
@@ -451,6 +516,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        started = time.monotonic()
         nonce_snapshot = {
             request_id: getattr(request, "lwd_prefix_nonce", 0)
             for request_id, request in self.requests.items()
@@ -465,11 +531,25 @@ class LwdCloudScheduler(LwdBaseScheduler):
         carriers = getattr(model_runner_output, "lwd_down_carriers", None)
         if carriers:
             for carrier in carriers:
+                timing = getattr(self, "_lwd_timing", None)
+                if timing is not None:
+                    timing.down_seqno = carrier[3]
                 self._lwd_append_carrier_c2e(
                     carrier[:4], engine_core_outputs, nonce_snapshot
                 )
         elif LwdControlDiag.disable_down_enabled():
             self._lwd_append_diag_c2e(engine_core_outputs, nonce_snapshot)
+        shape = getattr(self, "_lwd_step_shapes", {}).pop(id(scheduler_output), None)
+        timing = getattr(self, "_lwd_timing", None)
+        if timing is not None:
+            if shape is not None:
+                shape.output_tokens = sum(
+                    len(out.new_token_ids)
+                    for outputs in engine_core_outputs.values()
+                    for out in outputs.outputs
+                )
+                timing.shape = shape
+            timing.update += time.monotonic() - started
         return engine_core_outputs
 
     def _lwd_cleanup_arrivals(

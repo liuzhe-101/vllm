@@ -20,7 +20,8 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Generator, Iterable
+from contextlib import contextmanager
 from typing import Any
 
 import msgspec
@@ -65,6 +66,9 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     lwd_decode_structured_outputs,
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
+from vllm.v1.lwd_control.lwd_control_diag.lwd_latency_meter import (
+    LwdCloudStepTiming,
+)
 from vllm.v1.lwd_control.lwd_model.lwd_model_family import (
     lwd_cloud_engram_fingerprint,
 )
@@ -206,6 +210,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 "compilation and the sampling bitmask happen on the cloud"
             )
         self._lwd_init_prefix_cache()
+        self._lwd_timing = LwdCloudStepTiming()
+        self._lwd_step_open = False
+        self._lwd_range_stamps: dict[int, float] = {}
         self._lwd_edges: set[LwdPeer] = set()
         self._lwd_ledger = LwdCloudLedger(self.scheduler)
         self.scheduler.lwd_hash_block_size = self._lwd_hash_block_size
@@ -462,6 +469,8 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             ),
         ):
             return False
+        if isinstance(msg, LwdRangeNotify):
+            self._lwd_range_stamps[(peer, msg.seqno)] = time.monotonic()
         self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, (peer, msg)))
         return True
 
@@ -520,7 +529,11 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                     for item in msg.items
                 ],
             )
-            self._lwd_handle_range_notify(connection_id, msg)
+            self._lwd_handle_range_notify(
+                connection_id,
+                msg,
+                self._lwd_range_stamps.pop((peer, msg.seqno), None),
+            )
             return
         if not isinstance(msg, (LwdRequestNotify, LwdAbortNotify)):
             return
@@ -539,7 +552,10 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         )
 
     def _lwd_handle_range_notify(
-        self, connection_id: LwdConnectionId, notify: LwdRangeNotify
+        self,
+        connection_id: LwdConnectionId,
+        notify: LwdRangeNotify,
+        received_at: float | None = None,
     ) -> None:
         """Post each new extended hint exactly once, per source connection."""
         latest = self._lwd_ledger.latest_seqnos.get(connection_id, -1)
@@ -583,6 +599,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         }
         if any(item.is_refill for item in items):
             hint_fields["refills"] = [item.is_refill for item in items]
+        post_started = time.monotonic()
         post_irecv_hint(
             make_recv_hint(
                 notify.seqno,
@@ -591,6 +608,11 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 **hint_fields,
             )
         )
+        meter = getattr(self.scheduler, "lwd_exec_meter", None)
+        if meter is not None and received_at is not None:
+            meter.note_range(
+                post_started - received_at, time.monotonic() - post_started
+            )
 
     def _lwd_handle_request_notify(self, notify: LwdRequestNotify) -> None:
         request_id = notify.request_id
@@ -651,6 +673,12 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self.input_queue.put_nowait((EngineCoreRequestType.ABORT, [request_id]))
 
     def shutdown(self) -> None:
+        meter = getattr(self.scheduler, "lwd_exec_meter", None)
+        if meter is not None:
+            if getattr(self, "_lwd_step_open", False):
+                meter.note_step(self._lwd_timing)
+                self._lwd_step_open = False
+            meter.flush()
         super().shutdown()
 
     def _lwd_build_request(self, req_notify: LwdRequestNotify) -> Request:
@@ -762,6 +790,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     def step_with_batch_queue(self):
         """Drain the early-recv watermark at the head of the step (done
         MQ -> gate readiness predicate); the rest is native."""
+        self._lwd_open_step()
         self._lwd_poll_coordination()
         self._lwd_drain_irecv_completions()
         engine_core_outputs, model_executed = super().step_with_batch_queue()
@@ -772,12 +801,37 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     def step(self):
         """Same for the synchronous step path: drain the watermark at
         the head of the step, the rest is native."""
+        self._lwd_open_step()
         self._lwd_poll_coordination()
         self._lwd_drain_irecv_completions()
         engine_core_outputs, model_executed = super().step()
         self._lwd_publish_finished_usage(engine_core_outputs)
         self._lwd_retire_finished_outputs(engine_core_outputs)
         return engine_core_outputs, model_executed
+
+    def _lwd_open_step(self) -> None:
+        meter = self.scheduler.lwd_exec_meter
+        previous = self._lwd_timing
+        gap = 0.0
+        if self._lwd_step_open:
+            meter.note_step(previous)
+            gap = max(0.0, meter.take_pre_gap() - previous.dummy - previous.dp_sync)
+        self._lwd_timing = LwdCloudStepTiming(pre_gap=gap)
+        self._lwd_step_open = True
+        self.scheduler.lwd_open_step(self._lwd_timing)
+
+    @contextmanager
+    def capture_iteration_details(
+        self, scheduler_output: Any
+    ) -> Generator[Any, None, None]:
+        started = time.monotonic()
+        try:
+            with super().capture_iteration_details(scheduler_output) as details:
+                yield details
+        finally:
+            timing = getattr(self, "_lwd_timing", None)
+            if timing is not None:
+                timing.model_wait += time.monotonic() - started
 
     def _lwd_publish_finished_usage(self, engine_core_outputs: Any) -> None:
         records = self.scheduler.lwd_finished_records
@@ -967,7 +1021,11 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         """Flush pending c2e to the edge at the end of the step (the
         scheduler only queues them; both native step paths reach this hook)."""
         self._lwd_log_cloud_concurrency()
+        timing = getattr(self, "_lwd_timing", None)
+        started = time.monotonic()
         if self.scheduler.pending_c2e:
+            if timing is not None:
+                timing.c2e_count = len(self.scheduler.pending_c2e)
             finished_ids: list[str] = []
             for notify in self.scheduler.pending_c2e:
                 if not notify.req_ids:
@@ -998,7 +1056,14 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             self.scheduler.pending_c2e.clear()
             for request_id in finished_ids:
                 self._lwd_ledger.clear_retired(request_id)
+        sent = time.monotonic()
         super().post_step(model_executed)
+        now = time.monotonic()
+        if timing is not None:
+            timing.c2e_send += sent - started
+            timing.native_post += now - sent
+            timing.wall = now - timing.started
+            self.scheduler.lwd_exec_meter.note_step_end()
 
 
 class LwdCloudEngineCore(LwdCloudEngineCoreMixin, EngineCoreProc):
@@ -1012,3 +1077,21 @@ class LwdCloudDPEngineCore(LwdCloudEngineCoreMixin, DPEngineCoreProc):
     carries the wave state machine, dummy batches, START_DP_WAVE handling
     and stats publishing, so the MoE engines stay in lockstep exactly as a
     centralized DP deployment; the LWD seams come from the mixin."""
+
+    def execute_dummy_batch(self) -> None:
+        started = time.monotonic()
+        try:
+            super().execute_dummy_batch()
+        finally:
+            timing = getattr(self, "_lwd_timing", None)
+            if timing is not None:
+                timing.dummy += time.monotonic() - started
+
+    def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
+        started = time.monotonic()
+        try:
+            return super()._has_global_unfinished_reqs(local_unfinished)
+        finally:
+            timing = getattr(self, "_lwd_timing", None)
+            if timing is not None:
+                timing.dp_sync += time.monotonic() - started

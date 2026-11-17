@@ -54,6 +54,9 @@ from vllm.v1.lwd_control.lwd_comm.lwd_transport import (
     LwdEdgeTransport,
     LwdPeerUnreachableError,
 )
+from vllm.v1.lwd_control.lwd_control_diag.lwd_latency_meter import (
+    LwdControlPlaneMeter,
+)
 
 logger = init_lwd_logger(__name__)
 
@@ -269,6 +272,8 @@ class LwdControlPlane(ABC):
         self._num_dropped: dict[LwdPeer, int] = {}
         self._held: dict[LwdPeer, deque[bytes]] = {}
         self._held_since: dict[LwdPeer, float] = {}
+        self._held_queued_at: dict[int, float] = {}
+        self._io_meter = LwdControlPlaneMeter(self._label)
 
     def start(self, listener: LwdControlListener) -> LwdControlSender:
         """Open the link on a new IO thread and return the outbound handle.
@@ -320,6 +325,7 @@ class LwdControlPlane(ABC):
         self._registered_peers.clear()
         if self._sender is not None:
             self._sender.close()
+        self._io_meter.flush()
         if self._thread is not None and self._thread.is_alive():
             logger.error(
                 "[LWD][control-plane] %s: IO thread still alive after %.1fs; "
@@ -373,7 +379,10 @@ class LwdControlPlane(ABC):
         while not self._stop.is_set():
             # Drain the inproc queue while peer FIFOs have room. Blocked peers
             # retain their FIFOs; inbound traffic continues to be processed.
+            poll_started = time.monotonic()
+            held_messages = sum(len(queue) for queue in self._held.values())
             poller.poll(_LWD_IO_POLL_TICK_MS)
+            self._io_meter.note_poll(time.monotonic() - poll_started, held_messages)
             self._drain_inbound(transport)
             if self._stop.is_set():
                 return
@@ -439,6 +448,7 @@ class LwdControlPlane(ABC):
                 break
             peer = lwd_decode_peer(peer_frame)
             self._held.setdefault(peer, deque()).append(payload)
+            self._held_queued_at[id(payload)] = time.monotonic()
 
         # Retry only each FIFO's head, preserving per-peer ordering while
         # allowing every other peer to make progress.
@@ -446,11 +456,19 @@ class LwdControlPlane(ABC):
             if not queue:
                 self._release_held(peer)
                 continue
+            if len(queue) > 1:
+                self._io_meter.note_backlog(len(queue))
             if self._deliver(transport, peer, queue[0]):
-                queue.popleft()
+                payload = queue.popleft()
+                queued_at = self._held_queued_at.pop(id(payload), None)
+                if queued_at is not None:
+                    self._io_meter.note_delivery(
+                        time.monotonic() - queued_at, len(queue)
+                    )
                 if not queue:
                     self._release_held(peer)
             else:
+                self._io_meter.note_full()
                 self._note_held(peer)
 
     def _note_held(self, peer: LwdPeer) -> None:
@@ -512,6 +530,8 @@ class LwdControlPlane(ABC):
 
     def _unregister_peer(self, peer: LwdPeer, reason: str) -> None:
         self._registered_peers.discard(peer)
+        for payload in self._held.get(peer, ()):
+            self._held_queued_at.pop(id(payload), None)
         self._held.pop(peer, None)
         self._held_since.pop(peer, None)
         logger.warning(
