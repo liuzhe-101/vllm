@@ -61,9 +61,9 @@ class LwdEngramHasher:
     def from_model_config(cls, model_config: "ModelConfig") -> "LwdEngramHasher | None":
         """Build the hasher from the original checkpoint config.
 
-        The config is re-read from disk without overrides: the edge needs the
-        original Engram layout for hashing, although it holds no Engram table.
-        The tokenizer is loaded the way upstream `NgramHashState` loads it.
+        The edge projection clears the Engram fields through `hf_overrides`,
+        so the config is re-read from disk without overrides. The tokenizer
+        is loaded the way upstream `NgramHashState` loads it.
 
         Returns:
             None when the checkpoint has no Engram layers.

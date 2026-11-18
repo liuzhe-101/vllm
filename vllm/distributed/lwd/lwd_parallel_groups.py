@@ -212,8 +212,7 @@ def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
         NotImplementedError: A parallel feature, the topology or the Engram
             placement is unsupported.
         ValueError: The tensor parallel size differs from the ranks of each DP
-            of the local instance, or co-located cloud replicas do not share
-            their Engram table.
+            of the local instance, or the edge model kept n-gram layers.
     """
     lwd_config = vllm_config.lwd_config
     assert lwd_config is not None
@@ -266,9 +265,8 @@ def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
             f"!= {len(dp_ranks)} ranks per DP of {lwd_config.role} instance "
             f"{lwd_config.instance_id}"
         )
-    if lwd_config.role == "cloud":
-        _lwd_check_engram_layers(vllm_config)
-        _lwd_check_engram_sharing(vllm_config, spec)
+    _lwd_check_engram_layers(vllm_config)
+    _lwd_check_engram_sharing(vllm_config, spec)
 
 
 def _lwd_host_local_groups(dps: tuple[LwdDP, ...]) -> list[LwdRankGroup]:
@@ -344,12 +342,14 @@ def _lwd_check_engram_sharing(
 
 
 def _lwd_check_engram_layers(vllm_config: VllmConfig) -> None:
-    """Check the cloud's Engram architecture, whose tables LWD hashes.
+    """Engram tables live on the cloud, for the architectures LWD hashes.
 
-    The caller restricts this check to the cloud. The edge keeps the layer
-    ids as hash metadata; Ascend disables its Engram table construction.
+    Reads the model, not `engram_config`: a platform may resolve the Engram
+    config after this check (Ascend does, in `check_and_update_config`).
 
     Raises:
+        ValueError: The edge model kept its n-gram layers through the edge
+            projection.
         NotImplementedError: The cloud model has n-gram layers of an
             architecture LWD does not hash.
     """
@@ -359,6 +359,12 @@ def _lwd_check_engram_layers(vllm_config: VllmConfig) -> None:
     lwd_config = vllm_config.lwd_config
     assert lwd_config is not None
     architecture = model_config.architecture
+    if lwd_config.role == "edge":
+        raise ValueError(
+            f"[LWD] the edge {architecture} model keeps its n-gram embedding "
+            "layers; the edge projection clears them unless hf_overrides is a "
+            "dict that updates a sub-config: pass flat keys or a callable"
+        )
     if architecture not in _LWD_ENGRAM_ARCHITECTURES:
         raise NotImplementedError(
             f"[LWD] Engram of {architecture} is not supported in edge-cloud "
