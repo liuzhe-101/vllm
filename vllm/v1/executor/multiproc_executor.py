@@ -1062,10 +1062,10 @@ class WorkerProc:
         started = time.monotonic()
         with torch.npu.stream(stream):
             stream.wait_event(ready_event)
-            copy_started = torch.npu.Event()
+            copy_started = torch.npu.Event(enable_timing=True)
             copy_started.record()
             buf[:n_dev].copy_(meta_dev, non_blocking=True)
-            done = torch.npu.Event()
+            done = torch.npu.Event(enable_timing=True)
             done.record()
         done.synchronize()
         copy_s = copy_started.elapsed_time(done) / 1000
