@@ -67,6 +67,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.lwd_control.lwd_control_diag.lwd_latency_meter import (
     LwdEdgeOutputMeter,
+    LwdEdgeUnembedTiming,
 )
 from vllm.v1.lwd_control.lwd_model.lwd_model_family import (
     LwdModelFamily,
@@ -161,6 +162,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # produce an UNEMBED batch
         self.unembed_notify_queue: deque[tuple[LwdConnectionId, LwdC2eNotify]] = deque()
         self._lwd_c2e_stamps: dict[int, list[float | None]] = {}
+        self._lwd_unembed_worker_waits: dict[int, float] = {}
         self._lwd_output_meter = LwdEdgeOutputMeter()
         # Per-model-family admission metadata: whole-prompt M-RoPE
         # positions for multimodal families. Computed once at admission from
@@ -411,6 +413,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return lwd_build_unembed_batch(dp_idx, notify)
         return SchedulerOutput.make_empty()
 
+    def lwd_edge_note_worker_wait(
+        self, scheduler_output: SchedulerOutput, seconds: float
+    ) -> None:
+        self._lwd_unembed_worker_waits[id(scheduler_output)] = seconds
+
     def update_from_output(self, scheduler_output, model_runner_output):
         """LWD harvest (the return value is the engine step output; none of
         it goes through native bookkeeping): EMBED batches register
@@ -420,6 +427,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         without lwd_batch (the underlying layer returns None on normal
         completion, replaced by the engine proxy with a placeholder) only
         consume send watermarks."""
+        update_started = time.monotonic()
         watermarks = getattr(model_runner_output, "lwd_up_send_watermarks", {})
         for dp_idx, watermark in watermarks.items():
             if isinstance(dp_idx, int):
@@ -450,7 +458,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # models requests only leave `requests` upon termination, so the
         # explicit per-point removal is replaced by reconciliation-style
         # reclaim)
-        self._lwd_note_unembed_complete(scheduler_output, outputs)
+        self._lwd_note_unembed_complete(scheduler_output, outputs, update_started)
         self._lwd_purge_admission_metadata()
         if not outputs:
             return {}
@@ -466,6 +474,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self,
         scheduler_output: SchedulerOutput,
         outputs: dict[int, list[EngineCoreOutput]],
+        update_started: float,
     ) -> None:
         batch = getattr(scheduler_output, "lwd_batch", None)
         if batch is None or batch.batch_type != LwdBatchType.LWD_UNEMBED:
@@ -482,9 +491,23 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         num_tokens = sum(
             len(output.new_token_ids) for outs in outputs.values() for output in outs
         )
+        worker_wait = getattr(self, "_lwd_unembed_worker_waits", {}).pop(
+            id(scheduler_output), 0.0
+        )
+        update_s = now - update_started
+        other = max(0.0, roundtrip - worker_wait - update_s)
         meter = getattr(self, "_lwd_output_meter", None)
         if meter is not None:
-            meter.note_unembed(queue_wait, roundtrip, num_tokens)
+            meter.note_unembed(
+                LwdEdgeUnembedTiming(
+                    queue=queue_wait,
+                    worker_wait=worker_wait,
+                    update=update_s,
+                    other=other,
+                    roundtrip=roundtrip,
+                    tokens=num_tokens,
+                )
+            )
 
     @staticmethod
     def _lwd_row_disposition(accepted: int, has_tokens: bool, finished: bool) -> str:

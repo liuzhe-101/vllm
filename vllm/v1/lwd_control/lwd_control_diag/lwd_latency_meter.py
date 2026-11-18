@@ -347,32 +347,88 @@ class LwdControlPlaneMeter(LwdIntervalMeter):
         )
 
 
+class LwdExecutorOutputMeter(LwdIntervalMeter):
+    """Worker output-thread harvest, async output resolution and response enqueue."""
+
+    def __init__(self, rank: int) -> None:
+        self._rank = rank
+        super().__init__()
+
+    def _reset(self) -> None:
+        self._outputs = 0
+        self._carriers = 0
+        self._meta_harvest = LwdSpan()
+        self._output_get = LwdSpan()
+        self._response_enqueue = LwdSpan()
+
+    def note_harvest(self, seconds: float) -> None:
+        self._carriers += 1
+        self._meta_harvest.add(seconds)
+
+    def note_output(self, output_get: float, response_enqueue: float) -> None:
+        self._outputs += 1
+        self._output_get.add(output_get)
+        self._response_enqueue.add(response_enqueue)
+        self._roll()
+
+    def _report(self) -> None:
+        if not self._outputs and not self._carriers:
+            return
+        logger.info(
+            "[lwd][executor-output] rank%d outputs=%d carriers=%d "
+            "meta_harvest=%s output_get=%s response_enqueue=%s (avg/max ms)",
+            self._rank,
+            self._outputs,
+            self._carriers,
+            self._meta_harvest,
+            self._output_get,
+            self._response_enqueue,
+        )
+
+
+@dataclass(slots=True)
+class LwdEdgeUnembedTiming:
+    queue: float
+    worker_wait: float
+    update: float
+    other: float
+    roundtrip: float
+    tokens: int
+
+
 class LwdEdgeOutputMeter(LwdIntervalMeter):
-    """Split edge C2E queuing from the UNEMBED worker round trip."""
+    """Split edge C2E queuing from UNEMBED wait and delivery update."""
 
     def _reset(self) -> None:
         self._outputs = 0
         self._tokens = 0
         self._unembed_queue = LwdSpan()
-        self._unembed_roundtrip = LwdSpan()
+        self._worker_wait = LwdSpan()
+        self._update = LwdSpan()
+        self._other = LwdSpan()
+        self._roundtrip = LwdSpan()
 
-    def note_unembed(
-        self, queue_wait: float, roundtrip: float, num_tokens: int
-    ) -> None:
+    def note_unembed(self, timing: LwdEdgeUnembedTiming) -> None:
         self._outputs += 1
-        self._tokens += num_tokens
-        self._unembed_queue.add(queue_wait)
-        self._unembed_roundtrip.add(roundtrip)
+        self._tokens += timing.tokens
+        self._unembed_queue.add(timing.queue)
+        self._worker_wait.add(timing.worker_wait)
+        self._update.add(timing.update)
+        self._other.add(timing.other)
+        self._roundtrip.add(timing.roundtrip)
         self._roll()
 
     def _report(self) -> None:
         if not self._outputs:
             return
         logger.info(
-            "[lwd][edge-output] %d unembeds tokens=%d queue=%s "
-            "worker_and_update=%s (avg/max ms)",
+            "[lwd][edge-output] %d unembeds tokens=%d queue=%s worker_wait=%s "
+            "update=%s other=%s roundtrip=%s (avg/max ms)",
             self._outputs,
             self._tokens,
             self._unembed_queue,
-            self._unembed_roundtrip,
+            self._worker_wait,
+            self._update,
+            self._other,
+            self._roundtrip,
         )

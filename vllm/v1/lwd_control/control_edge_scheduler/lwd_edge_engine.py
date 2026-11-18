@@ -19,10 +19,13 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
+from collections.abc import Generator
+from contextlib import contextmanager
 from typing import Any
 
 from vllm.config.lwd import LwdConnectionId
 from vllm.lwd_logger import lwd_logger
+from vllm.v1.core.sched.output import LwdBatchType
 from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequestType
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_coord_client import (
     LwdCoordClient,
@@ -410,6 +413,21 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
         self._lwd_drain_probe_completions()
         return super().step_with_batch_queue()
+
+    @contextmanager
+    def capture_iteration_details(
+        self, scheduler_output: Any
+    ) -> Generator[Any, None, None]:
+        started = time.monotonic()
+        try:
+            with super().capture_iteration_details(scheduler_output) as details:
+                yield details
+        finally:
+            batch = getattr(scheduler_output, "lwd_batch", None)
+            if batch is not None and batch.batch_type is LwdBatchType.LWD_UNEMBED:
+                self.scheduler.lwd_edge_note_worker_wait(
+                    scheduler_output, time.monotonic() - started
+                )
 
     def abort_requests(self, request_ids: list[str]) -> None:
         """Notify each request's original cloud DP, then finish natively."""

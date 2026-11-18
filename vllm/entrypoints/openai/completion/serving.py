@@ -48,6 +48,9 @@ from vllm.tokenizers import TokenizerLike
 from vllm.utils.async_utils import merge_async_iterators
 from vllm.utils.collection_utils import as_list
 from vllm.utils.serial_utils import numpy2base64
+from vllm.v1.lwd_control.lwd_control_diag.lwd_frontend_meter import (
+    LWD_FRONTEND_METER,
+)
 
 logger = init_logger(__name__)
 
@@ -438,6 +441,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                         )
 
                     response_json = chunk.model_dump_json(exclude_unset=True)
+                    LWD_FRONTEND_METER.note_processor_to_sse(res)
                     yield f"data: {response_json}\n\n"
 
             total_prompt_tokens = sum(num_prompt_tokens)

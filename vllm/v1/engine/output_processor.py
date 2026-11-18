@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -32,6 +33,10 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
+from vllm.v1.lwd_control.lwd_control_diag.lwd_frontend_meter import (
+    LWD_FRONTEND_METER,
+    LwdCollectorState,
+)
 from vllm.v1.metrics.stats import (
     IterationStats,
     LoRARequestStates,
@@ -64,15 +69,20 @@ class RequestOutputCollector:
         self.ready = asyncio.Event()
 
         self._input_stream_task: asyncio.Task | None = None
+        self._lwd_frontend_state = LwdCollectorState()
 
     def put(self, output: RequestOutput | PoolingRequestOutput | Exception) -> None:
         """Non-blocking put operation."""
         if self.output is None or isinstance(output, Exception):
             self.output = output
+            LWD_FRONTEND_METER.note_collector_put(
+                self._lwd_frontend_state, merged=False
+            )
             self.ready.set()
         elif isinstance(self.output, RequestOutput) and isinstance(
             output, RequestOutput
         ):
+            LWD_FRONTEND_METER.note_collector_put(self._lwd_frontend_state, merged=True)
             # This ensures that request outputs with different request indexes
             # (if n > 1) do not override each other.
             self.output.add(output, aggregate=self.aggregate)
@@ -80,6 +90,9 @@ class RequestOutputCollector:
             output, PoolingRequestOutput
         ):
             self.output = output
+            LWD_FRONTEND_METER.note_collector_put(
+                self._lwd_frontend_state, merged=False
+            )
 
     async def get(self) -> RequestOutput | PoolingRequestOutput:
         """Get operation blocks on put event."""
@@ -87,6 +100,7 @@ class RequestOutputCollector:
             await self.ready.wait()
         self.output = None
         self.ready.clear()
+        LWD_FRONTEND_METER.note_collector_get(output, self._lwd_frontend_state)
         if isinstance(output, Exception):
             raise output
         return output
@@ -97,6 +111,7 @@ class RequestOutputCollector:
         if output is not None:
             self.output = None
             self.ready.clear()
+            LWD_FRONTEND_METER.note_collector_get(output, self._lwd_frontend_state)
         if isinstance(output, Exception):
             raise output
         return output
@@ -627,6 +642,20 @@ class OutputProcessor:
             req_state.input_chunk_queue.append(update)
 
     def process_outputs(
+        self,
+        engine_core_outputs: list[EngineCoreOutput],
+        engine_core_timestamp: float | None = None,
+        iteration_stats: IterationStats | None = None,
+    ) -> OutputProcessorOutput:
+        started = time.monotonic()
+        try:
+            return self._process_outputs(
+                engine_core_outputs, engine_core_timestamp, iteration_stats
+            )
+        finally:
+            LWD_FRONTEND_METER.note_process_outputs(started, engine_core_timestamp)
+
+    def _process_outputs(
         self,
         engine_core_outputs: list[EngineCoreOutput],
         engine_core_timestamp: float | None = None,

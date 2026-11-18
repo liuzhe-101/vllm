@@ -52,6 +52,9 @@ from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollec
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.executor import Executor
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
+from vllm.v1.lwd_control.lwd_control_diag.lwd_frontend_meter import (
+    LWD_FRONTEND_METER,
+)
 from vllm.v1.metrics.loggers import (
     StatLoggerFactory,
     StatLoggerManager,
@@ -276,6 +279,7 @@ class AsyncLLM(EngineClient):
 
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown, cleaning up the background proc and IPC."""
+        LWD_FRONTEND_METER.flush()
         shutdown_prometheus()
 
         if renderer := getattr(self, "renderer", None):

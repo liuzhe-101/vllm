@@ -43,7 +43,6 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
-from vllm.lwd_logger import lwd_logger
 from vllm.platforms import current_platform
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.utils import numa_utils
@@ -70,6 +69,9 @@ from vllm.utils.torch_utils import (
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
+from vllm.v1.lwd_control.lwd_control_diag.lwd_latency_meter import (
+    LwdExecutorOutputMeter,
+)
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
@@ -975,6 +977,9 @@ class WorkerProc:
             # Clean up once worker exits busy loop
             if worker is not None:
                 worker.shutdown()
+            meter = getattr(worker, "_lwd_output_meter", None)
+            if meter is not None:
+                meter.flush()
 
     class ResponseStatus(Enum):
         SUCCESS = auto()
@@ -997,11 +1002,15 @@ class WorkerProc:
             ]
 
         if isinstance(output, AsyncModelRunnerOutput):
+            get_started = time.monotonic()
             try:
                 output = output.get_output()
             except Exception as e:
                 logger.exception("Error getting async model runner output")
                 output = e
+            get_done = time.monotonic()
+        else:
+            get_started = get_done = time.monotonic()
 
         if isinstance(output, Exception):
             result = (WorkerProc.ResponseStatus.FAILURE, str(output))
@@ -1009,6 +1018,16 @@ class WorkerProc:
             result = (WorkerProc.ResponseStatus.SUCCESS, output)
         if (response_mq := self.worker_response_mq) is not None:
             response_mq.enqueue(result)
+        if carriers is not None or ready_events is not None:
+            self._lwd_get_output_meter().note_output(
+                get_done - get_started, time.monotonic() - get_done
+            )
+
+    def _lwd_get_output_meter(self) -> LwdExecutorOutputMeter:
+        meter = getattr(self, "_lwd_output_meter", None)
+        if meter is None:
+            meter = self._lwd_output_meter = LwdExecutorOutputMeter(self.rank)
+        return meter
 
     def _lwd_harvest_connection_carrier(self, carrier: Any, ready_events: Any) -> tuple:
         """Harvest one multi-connection DOWN carrier behind its ready event.
@@ -1049,12 +1068,7 @@ class WorkerProc:
         done.synchronize()
         if n_seg:
             buf.numpy()[n_dev:n_meta] = seg_lens_host
-        lwd_logger.info(
-            "[Lwd][perf] meta-harvest connection=%s dur=%.2fms ts=%.3f",
-            connection,
-            (time.monotonic() - started) * 1000,
-            time.monotonic(),
-        )
+        self._lwd_get_output_meter().note_harvest(time.monotonic() - started)
         return (buf[:n_meta], req_ids, hidden_numel, seqno, connection)
 
     def handle_output(self, output: Any):
