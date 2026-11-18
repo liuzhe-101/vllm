@@ -1062,13 +1062,17 @@ class WorkerProc:
         started = time.monotonic()
         with torch.npu.stream(stream):
             stream.wait_event(ready_event)
+            copy_started = torch.npu.Event()
+            copy_started.record()
             buf[:n_dev].copy_(meta_dev, non_blocking=True)
             done = torch.npu.Event()
             done.record()
         done.synchronize()
+        copy_s = copy_started.elapsed_time(done) / 1000
         if n_seg:
             buf.numpy()[n_dev:n_meta] = seg_lens_host
-        self._lwd_get_output_meter().note_harvest(time.monotonic() - started)
+        elapsed = time.monotonic() - started
+        self._lwd_get_output_meter().note_harvest(elapsed, copy_s)
         return (buf[:n_meta], req_ids, hidden_numel, seqno, connection)
 
     def handle_output(self, output: Any):

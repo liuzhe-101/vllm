@@ -1806,6 +1806,7 @@ class GPUModelRunner(
         """
 
         # Sync the async PP broadcast before reading sampled tokens.
+        meter = getattr(getattr(self, "worker", None), "_lwd_worker_meter", None)
         if self._pp_recv_work is not None:
             self._pp_recv_work.wait()
             self._pp_recv_work = None
@@ -1814,7 +1815,12 @@ class GPUModelRunner(
             # Normal scheduling case
             self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
             if self.enable_prompt_embeds:
+                embed_started = time.monotonic()
                 self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
+                if meter is not None:
+                    meter.note_prepare_detail(
+                        "inputs_embeds_h2d", time.monotonic() - embed_started
+                    )
                 self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
             return
 
@@ -1872,7 +1878,12 @@ class GPUModelRunner(
             # we need to copy the input_ids_cpu to the GPU first.
             self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
             if self.enable_prompt_embeds:
+                embed_started = time.monotonic()
                 self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
+                if meter is not None:
+                    meter.note_prepare_detail(
+                        "inputs_embeds_h2d", time.monotonic() - embed_started
+                    )
         if num_common_tokens == 0:
             # No requests in common with the previous iteration
             # So input_ids.cpu will have all the input ids.

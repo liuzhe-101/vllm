@@ -358,12 +358,16 @@ class LwdExecutorOutputMeter(LwdIntervalMeter):
         self._outputs = 0
         self._carriers = 0
         self._meta_harvest = LwdSpan()
+        self._harvest_ready_other = LwdSpan()
+        self._harvest_copy = LwdSpan()
         self._output_get = LwdSpan()
         self._response_enqueue = LwdSpan()
 
-    def note_harvest(self, seconds: float) -> None:
+    def note_harvest(self, seconds: float, copy_seconds: float) -> None:
         self._carriers += 1
         self._meta_harvest.add(seconds)
+        self._harvest_ready_other.add(max(0.0, seconds - copy_seconds))
+        self._harvest_copy.add(copy_seconds)
 
     def note_output(self, output_get: float, response_enqueue: float) -> None:
         self._outputs += 1
@@ -376,11 +380,14 @@ class LwdExecutorOutputMeter(LwdIntervalMeter):
             return
         logger.info(
             "[lwd][executor-output] rank%d outputs=%d carriers=%d "
-            "meta_harvest=%s output_get=%s response_enqueue=%s (avg/max ms)",
+            "meta_harvest=%s harvest_ready_other=%s harvest_copy=%s "
+            "output_get=%s response_enqueue=%s (avg/max ms)",
             self._rank,
             self._outputs,
             self._carriers,
             self._meta_harvest,
+            self._harvest_ready_other,
+            self._harvest_copy,
             self._output_get,
             self._response_enqueue,
         )
