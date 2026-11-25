@@ -156,20 +156,17 @@ class LwdCloudScheduler(LwdBaseScheduler):
         return decode_exact
 
     def _lwd_prep_prefix_readmission(self, request: Request) -> bool:
-        """Revalidate a preempted request against live blocks and arrivals."""
+        """Revalidate a preempted request against live blocks and arrivals.
+
+        Every admitted request went through nonce/READY negotiation: it
+        carries a reservation floor and its staged prompt may be trimmed up
+        to that floor, regardless of whether the edge's gateway probe
+        succeeded. Readmission must therefore never bypass this
+        revalidation: scheduling below the floor without a refill reads
+        host-stage rows the edge never sent.
+        """
         reservations = getattr(self, "lwd_prefix_reservations", None)
         assert reservations is not None
-        if not getattr(request, "lwd_prefix_probe_succeeded", True):
-            # Fail-open admission still reserved a snapshot: add_request pins
-            # every request with a nonce and adopted hashes, and the edge
-            # sends a nonzero probe nonce even when its probe failed. Pin a
-            # zero-hit readmission instead of leaving that stale floor
-            # unowned: without a reservation entry the fail-closed snapshot
-            # contract kills the engine at native admission. Full prompt
-            # recompute, no refill.
-            self.lwd_prefix_hits[request.request_id] = 0
-            reservations.reserve_hit(request, (), 0, 0)
-            return True
         floor = self.lwd_prefix_hits.get(
             request.request_id, getattr(request, "lwd_resume_cap_tokens", 0)
         )

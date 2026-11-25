@@ -680,24 +680,31 @@ def test_skip_reading_readmission_does_not_lookup() -> None:
     scheduler.kv_cache_manager.block_pool.touch.assert_not_called()
 
 
-def test_fail_open_readmission_pins_zero_hit_reservation() -> None:
-    """Regression: a preempted fail-open request must re-enter admission
-    with a reservation entry; the stale floor without one trips the
-    fail-closed snapshot contract and kills the engine."""
-    request = _request(prompt=64, computed=0, preemptions=1, floor=32)
-    request.lwd_prefix_probe_succeeded = False
-    scheduler = _prefix_scheduler(request, (), hit=32, recv_rows=40)
+def test_readmission_below_floor_gates_behind_refill_despite_full_arrivals() -> None:
+    """Regression: a preempted request whose live hit fell below the
+    reservation floor must be gated behind a refill even when every
+    post-trim row has already arrived -- the [0, floor) host rows were
+    trimmed by the edge, so scheduling from 0 would read an unfilled hole
+    and kill the host stage."""
+    request = _request(prompt=131784, computed=0, preemptions=1, floor=8192)
+    request.lwd_prefix_nonce = 11
+    scheduler = _prefix_scheduler(request, (), hit=0, recv_rows=131784)
 
-    windows = scheduler._lwd_collect_prefill_windows(room=8)
+    assert scheduler._lwd_collect_prefill_windows(room=8176) == []
+    scheduler.lwd_refill_sender.assert_called_once_with("p", 0, 8192, 11)
+    assert scheduler._lwd_refill_gate == {"p"}
+    # Readmission re-established the reservation, keeping the fail-closed
+    # snapshot contract intact.
+    assert scheduler.lwd_prefix_reservations.snapshot(request) == ((), 0, 0)
 
-    assert [(w.start, w.num_rows) for w in windows] == [(0, 8)]
-    reservations = scheduler.lwd_prefix_reservations
-    assert reservations.has("p")
-    assert reservations.hit_of("p") == 0
-    assert reservations.snapshot(request) == ((), 0, 0)
-    scheduler.kv_cache_manager.coordinator.find_longest_cache_hit.assert_not_called()
-    scheduler.kv_cache_manager.block_pool.touch.assert_not_called()
-    scheduler.lwd_refill_sender.assert_not_called()
+    # Still gated: arrivals alone cannot lift a refill.
+    assert scheduler._lwd_collect_prefill_windows(room=8176) == []
+    scheduler.lwd_refill_sender.assert_called_once()
+
+    scheduler.lwd_refill_done("p", 11)
+    assert scheduler._lwd_refill_gate == set()
+    windows = scheduler._lwd_collect_prefill_windows(room=8176)
+    assert [(w.start, w.num_rows) for w in windows] == [(0, 8176)]
 
 
 def test_c2e_prefix_nonces_read_from_snapshot() -> None:
