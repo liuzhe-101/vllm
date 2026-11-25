@@ -680,6 +680,26 @@ def test_skip_reading_readmission_does_not_lookup() -> None:
     scheduler.kv_cache_manager.block_pool.touch.assert_not_called()
 
 
+def test_fail_open_readmission_pins_zero_hit_reservation() -> None:
+    """Regression: a preempted fail-open request must re-enter admission
+    with a reservation entry; the stale floor without one trips the
+    fail-closed snapshot contract and kills the engine."""
+    request = _request(prompt=64, computed=0, preemptions=1, floor=32)
+    request.lwd_prefix_probe_succeeded = False
+    scheduler = _prefix_scheduler(request, (), hit=32, recv_rows=40)
+
+    windows = scheduler._lwd_collect_prefill_windows(room=8)
+
+    assert [(w.start, w.num_rows) for w in windows] == [(0, 8)]
+    reservations = scheduler.lwd_prefix_reservations
+    assert reservations.has("p")
+    assert reservations.hit_of("p") == 0
+    assert reservations.snapshot(request) == ((), 0, 0)
+    scheduler.kv_cache_manager.coordinator.find_longest_cache_hit.assert_not_called()
+    scheduler.kv_cache_manager.block_pool.touch.assert_not_called()
+    scheduler.lwd_refill_sender.assert_not_called()
+
+
 def test_c2e_prefix_nonces_read_from_snapshot() -> None:
     request = _request()
     scheduler = _scheduler(request)

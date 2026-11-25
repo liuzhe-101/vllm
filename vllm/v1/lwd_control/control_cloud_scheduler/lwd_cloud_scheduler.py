@@ -157,14 +157,19 @@ class LwdCloudScheduler(LwdBaseScheduler):
 
     def _lwd_prep_prefix_readmission(self, request: Request) -> bool:
         """Revalidate a preempted request against live blocks and arrivals."""
-        if not getattr(request, "lwd_prefix_probe_succeeded", True):
-            # Fail-open requests have no initial reservation by contract.
-            # Recompute the full prompt after preemption instead of creating a
-            # fictitious zero-hit reservation or triggering a refill.
-            self.lwd_prefix_hits[request.request_id] = 0
-            return True
         reservations = getattr(self, "lwd_prefix_reservations", None)
         assert reservations is not None
+        if not getattr(request, "lwd_prefix_probe_succeeded", True):
+            # Fail-open admission still reserved a snapshot: add_request pins
+            # every request with a nonce and adopted hashes, and the edge
+            # sends a nonzero probe nonce even when its probe failed. Pin a
+            # zero-hit readmission instead of leaving that stale floor
+            # unowned: without a reservation entry the fail-closed snapshot
+            # contract kills the engine at native admission. Full prompt
+            # recompute, no refill.
+            self.lwd_prefix_hits[request.request_id] = 0
+            reservations.reserve_hit(request, (), 0, 0)
+            return True
         floor = self.lwd_prefix_hits.get(
             request.request_id, getattr(request, "lwd_resume_cap_tokens", 0)
         )
