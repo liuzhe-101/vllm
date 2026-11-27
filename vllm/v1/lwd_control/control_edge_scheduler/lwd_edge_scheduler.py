@@ -316,11 +316,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         """Whether this step has anything to do; False parks the engine on
         its input queue.
 
-        Keep stepping while any UP send still needs watermark settlement: a
-        full pending gate stops new EMBED batches, but the empty UNEMBED
-        step still executes the worker and harvests completed sends, and
-        without that term the edge sleeps holding sends no later batch can
-        clear.
+        Keep stepping while a UP send settlement blocks prefill work: a
+        full pending gate stops new EMBED batches, and only a step's worker
+        round trip harvests the completed sends, so work waiting behind
+        pending watermarks must keep the engine stepping. Pending sends
+        with no prefill work behind them do not: their settlement rides on
+        the next UNEMBED step (one per cloud step, woken by the c2e
+        WAKEUP) or EMBED step, both of which harvest watermarks in
+        update_from_output. Stepping for them in decode steady state only
+        burned one worker round trip per loop and the GIL against the
+        control-plane IO thread.
 
         Every term is one an event can clear while parked: requests arrive
         on the input queue, and the control plane posts a WAKEUP for c2e,
@@ -338,7 +343,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             or bool(self._lwd_pending_refills)
             or (self.lwd_has_pending is not None and self.lwd_has_pending())
             or any(self._lwd_aborted_req_ids.values())
-            or any(account.pending_chunks() for account in self._lwd_accounts.values())
+            or any(
+                account.pending_chunks() and self._lwd_has_prefill_work(connection)
+                for connection, account in self._lwd_accounts.items()
+            )
             or self._lwd_embed_dispatchable()
         )
 

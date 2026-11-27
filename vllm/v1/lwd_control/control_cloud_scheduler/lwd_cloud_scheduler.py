@@ -344,21 +344,46 @@ class LwdCloudScheduler(LwdBaseScheduler):
                     f"lookahead={lookahead}, decode_exact={decode_exact}"
                 )
 
-    @staticmethod
     def _lwd_warn_under_scheduled(
-        out: SchedulerOutput, windows: list[_LwdPrefillWindow]
+        self, out: SchedulerOutput, windows: list[_LwdPrefillWindow]
     ) -> None:
         requested = sum(window.num_rows for window in windows)
         scheduled = sum(
             out.num_scheduled_tokens.get(window.request.request_id, 0)
             for window in windows
         )
-        if scheduled < requested:
+        if scheduled >= requested:
+            return
+        lwd_logger.warning(
+            "[cloud-sched] native under-scheduled prefill=%d < windows=%d; "
+            "the remainder is retried next step",
+            scheduled,
+            requested,
+        )
+        # Per-request detail: which native guard dropped the window. The
+        # aggregate line above stays stable for log tooling; these lines name
+        # the request so the starving guard is identifiable in one run.
+        for window in windows:
+            request = window.request
+            got = out.num_scheduled_tokens.get(request.request_id, 0)
+            if got >= window.num_rows:
+                continue
             lwd_logger.warning(
-                "[cloud-sched] native under-scheduled prefill=%d < windows=%d; "
-                "the remainder is retried next step",
-                scheduled,
-                requested,
+                "[cloud-sched] under-scheduled req=%s start=%d want=%d got=%d "
+                "prompt=%d computed=%d recv_rows=%d eligible_step=%d cur_step=%d "
+                "is_chunk=%s tokens_with_spec=%d placeholders=%d",
+                request.request_id,
+                window.start,
+                window.num_rows,
+                got,
+                request.num_prompt_tokens,
+                request.num_computed_tokens,
+                self.lwd_recv_rows.get(request.request_id, 0),
+                request.next_decode_eligible_step,
+                self.current_step,
+                request.is_prefill_chunk,
+                request.num_tokens_with_spec,
+                request.num_output_placeholders,
             )
 
     def _lwd_attach_request_metadata(self, out: SchedulerOutput) -> None:
