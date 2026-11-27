@@ -81,9 +81,13 @@ def _request(
         request_id=request_id,
         num_prompt_tokens=prompt,
         num_tokens=prompt,
+        num_tokens_with_spec=prompt,
         num_computed_tokens=computed,
         num_output_tokens=0,
+        num_output_placeholders=0,
         num_preemptions=preemptions,
+        next_decode_eligible_step=0,
+        is_prefill_chunk=computed < prompt,
         block_hashes=[],
         skip_reading_prefix_cache=skip,
         lwd_resume_cap_tokens=floor,
@@ -122,6 +126,7 @@ def _scheduler(request: _Request) -> LwdCloudScheduler:
     scheduler._lwd_refill_gate = set()
     scheduler._lwd_refill_pending = {}
     scheduler._lwd_prefill_group_cursor = 0
+    scheduler.current_step = 0
     scheduler.lwd_prefix_hits = {}
     scheduler.lwd_finished_records = {}
     return scheduler
