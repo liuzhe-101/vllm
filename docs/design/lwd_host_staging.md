@@ -17,13 +17,15 @@ For request `r`, define:
 
 The stager maintains `0 <= consumed <= W1 <= prompt_rows`. Arrival gaps are rejected, repeated ranges are idempotent, and reads cannot cross W1. W2 requires `start + scheduled <= W1` and `scheduled <= window_rows`; native under-scheduling is allowed and retried later. At dispatch, the runner additionally requires `consumed == num_computed_tokens == window.start`.
 
-The fixed **10/2/2** pipeline limits are internal implementation constants, not topology settings:
+The fixed **10/4/4** pipeline limits are internal implementation constants, not topology settings:
 
 | Limit | Value | Meaning |
 | --- | ---: | --- |
 | `LWD_MAX_PENDING_CHUNKS` | 10 | Per-cloud-DP edge gate on announced batches not yet covered by request settlement or the UP send watermark |
-| `_LWD_EARLY_RECV_MAX_INFLIGHT` | 2 | Cloud communication-thread limit on submitted, not yet reported UP receives |
-| `_LWD_HOST_STAGE_SLOTS` | 2 | Reusable device receive slots |
+| `_LWD_EARLY_RECV_MAX_INFLIGHT` | 4 | Cloud communication-thread limit on submitted, not yet reported UP receives |
+| `_LWD_HOST_STAGE_SLOTS` | 4 | Reusable device receive slots |
+
+Inflight and stage slots are raised together: with both at the same value, one slot holds the in-flight receive while the other holds the received-but-unconsumed batch, and steady state collapses to a single in-flight receive per connection — the edge's chunk N+1 embed then cannot overlap the cloud's chunk N forward, and stall steps (450-700ms) appear whenever the next chunk is not yet on the wire (field evidence: `pre-recv inflight=1 queued=0`). Stage slots must cover the received-but-unconsumed window, or every extra post bounces on `LwdHostStageSlotBusy`.
 
 A device slot is bounded by the maximum batched UP payload and is released after its D2H staging completes. It is distinct from the uncapped, request-lifetime host allocation.
 
