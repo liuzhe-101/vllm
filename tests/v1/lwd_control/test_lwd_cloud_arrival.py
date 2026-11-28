@@ -182,6 +182,28 @@ def test_decode_consumption_counts_no_padding_without_spec() -> None:
     assert scheduler._lwd_compute_decode_consumption(["d"]) == 1
 
 
+def test_decode_consumption_uses_the_step_native_is_about_to_run() -> None:
+    """The mirror runs before native's ``schedule()`` increments the step,
+    so the eligibility guard must compare against ``current_step + 1``.
+    With the V2 decode stagger (``next_decode_eligible_step = step + 1``
+    after every decode step, pp_size == 1), the stale comparison excluded
+    every active decode request every step: a 2-row-per-request budget
+    deficit that came straight off the prefill windows."""
+    request = _request("d", prompt=10, computed=10)
+    request.num_tokens_with_spec = 12
+    scheduler = _scheduler(request)
+    scheduler.num_spec_tokens = 1
+    scheduler.current_step = 50
+
+    # Steady decode: eligible exactly at the step native is about to run.
+    request.next_decode_eligible_step = 51
+    assert scheduler._lwd_compute_decode_consumption(["d"]) == 2
+
+    # Gated for the step after that: native skips it, so must the mirror.
+    request.next_decode_eligible_step = 52
+    assert scheduler._lwd_compute_decode_consumption(["d"]) == 0
+
+
 def _prefix_scheduler(
     request: _Request, groups: tuple[object, ...], hit: int, recv_rows: int
 ) -> LwdCloudScheduler:

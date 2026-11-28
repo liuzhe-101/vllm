@@ -150,6 +150,15 @@ class LwdCloudScheduler(LwdBaseScheduler):
         cap only loosens, and ``lwd_window_cap`` still clamps every window
         request to its arrived rows, so the padding is counted whenever it
         may apply.
+
+        The eligibility guard must use the step number native is about to
+        execute, not the last one: this mirror runs before native's
+        ``schedule()`` increments ``current_step``, while native's running
+        loop checks after. With the V2 runner's decode stagger
+        (``next_decode_eligible_step = step + pp_size`` after every decode
+        step, pp_size == 1), comparing against the stale step excluded
+        every active decode request every step -- a deficit of 2 rows per
+        decode request that came straight off the prefill windows.
         """
         decode_exact = 0
         mirror_rows: dict[str, int] = {}
@@ -162,7 +171,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 >= request.num_prompt_tokens + request.max_tokens
             ):
                 continue
-            if self.current_step < request.next_decode_eligible_step:
+            if self.current_step + 1 < request.next_decode_eligible_step:
                 continue
             consumption = (
                 request.num_tokens_with_spec
@@ -416,18 +425,20 @@ class LwdCloudScheduler(LwdBaseScheduler):
             shown = 0
             for request_id in decode_ids:
                 native = out.num_scheduled_tokens.get(request_id, 0)
+                if native == 0:
+                    continue
                 mirror = mirror_rows.get(request_id)
-                if mirror is None or native == mirror:
+                if mirror == native:
                     continue
                 request = self.requests.get(request_id)
                 if request is None:
                     continue
                 lwd_logger.warning(
-                    "[cloud-sched] decode-divergent req=%s mirror=%d native=%d "
+                    "[cloud-sched] decode-divergent req=%s mirror=%s native=%d "
                     "computed=%d tokens_with_spec=%d placeholders=%d "
                     "eligible_step=%d cur_step=%d",
                     request_id,
-                    mirror,
+                    "excluded" if mirror is None else mirror,
                     native,
                     request.num_computed_tokens,
                     request.num_tokens_with_spec,
