@@ -14,7 +14,7 @@ the arrived-row high watermark is retained for readmission.
 from __future__ import annotations
 
 import itertools
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -120,7 +120,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
             out = self._lwd_schedule(decode_ids)
         if windows:
             self._lwd_verify_w2(out, windows, decode_exact)
-            self._lwd_warn_under_scheduled(out, windows)
+            self._lwd_warn_under_scheduled(out, windows, decode_ids, decode_exact)
         self._lwd_attach_request_metadata(out)
         self._lwd_attach_abort_notice(out)
         return out
@@ -152,6 +152,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         may apply.
         """
         decode_exact = 0
+        mirror_rows: dict[str, int] = {}
         for request_id in decode_ids:
             request = self.requests[request_id]
             placeholders = request.num_output_placeholders
@@ -175,7 +176,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 and self.dynamic_sd_lookup is None
             ):
                 consumption += self.num_spec_tokens
-            decode_exact += max(
+            counted = max(
                 0,
                 min(
                     consumption,
@@ -184,6 +185,11 @@ class LwdCloudScheduler(LwdBaseScheduler):
                     - request.num_computed_tokens,
                 ),
             )
+            mirror_rows[request_id] = counted
+            decode_exact += counted
+        # Per-request rows for the under-scheduled budget reconciliation;
+        # overwritten every step, read only by the warning in this step.
+        self._lwd_last_decode_mirror = mirror_rows
         return decode_exact
 
     def _lwd_prep_prefix_readmission(self, request: Request) -> bool:
@@ -368,7 +374,11 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 )
 
     def _lwd_warn_under_scheduled(
-        self, out: SchedulerOutput, windows: list[_LwdPrefillWindow]
+        self,
+        out: SchedulerOutput,
+        windows: list[_LwdPrefillWindow],
+        decode_ids: Sequence[str] = (),
+        decode_mirror: int = 0,
     ) -> None:
         requested = sum(window.num_rows for window in windows)
         scheduled = sum(
@@ -383,6 +393,51 @@ class LwdCloudScheduler(LwdBaseScheduler):
             scheduled,
             requested,
         )
+        # Budget reconciliation: the dispatch cap reserved decode_mirror for
+        # decode rows; if native spent more on decodes than the mirror
+        # predicted, the deficit came off the prefill windows. Naming the
+        # divergent decode requests (mirror vs native per-request) pins the
+        # missing accounting term in one run.
+        decode_native = sum(
+            out.num_scheduled_tokens.get(request_id, 0) for request_id in decode_ids
+        )
+        deficit = decode_native - decode_mirror
+        if deficit > 0:
+            mirror_rows = getattr(self, "_lwd_last_decode_mirror", {})
+            lwd_logger.warning(
+                "[cloud-sched] budget deficit=%d decode_native=%d decode_mirror=%d "
+                "windows=%d scheduled=%d",
+                deficit,
+                decode_native,
+                decode_mirror,
+                requested,
+                scheduled,
+            )
+            shown = 0
+            for request_id in decode_ids:
+                native = out.num_scheduled_tokens.get(request_id, 0)
+                mirror = mirror_rows.get(request_id)
+                if mirror is None or native == mirror:
+                    continue
+                request = self.requests.get(request_id)
+                if request is None:
+                    continue
+                lwd_logger.warning(
+                    "[cloud-sched] decode-divergent req=%s mirror=%d native=%d "
+                    "computed=%d tokens_with_spec=%d placeholders=%d "
+                    "eligible_step=%d cur_step=%d",
+                    request_id,
+                    mirror,
+                    native,
+                    request.num_computed_tokens,
+                    request.num_tokens_with_spec,
+                    request.num_output_placeholders,
+                    request.next_decode_eligible_step,
+                    self.current_step,
+                )
+                shown += 1
+                if shown >= 8:
+                    break
         # Per-request detail: which native guard dropped the window. The
         # aggregate line above stays stable for log tooling; these lines name
         # the request so the starving guard is identifiable in one run.
