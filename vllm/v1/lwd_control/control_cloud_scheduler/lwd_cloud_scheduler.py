@@ -137,7 +137,20 @@ class LwdCloudScheduler(LwdBaseScheduler):
         ]
 
     def _lwd_compute_decode_consumption(self, decode_ids: list[str]) -> int:
-        """Mirror native decode guards and placeholder accounting exactly."""
+        """Mirror native decode guards and placeholder accounting exactly.
+
+        The one native term no static mirror can know is the spec-decode
+        padding of a decode admission: native pads ``num_new_tokens == 1``
+        to ``1 + num_spec_tokens`` by queue order (waiting-path spec
+        padding), and an undercount here shrinks the dispatch budget cap by
+        exactly that padding -- cutting the last rows off a freshly
+        dispatched prefill window and then starving the tail chunk to zero
+        for consecutive steps (observed: want=2/24 got=0 while the big
+        window was cut by the same amount). An overcount is harmless: the
+        cap only loosens, and ``lwd_window_cap`` still clamps every window
+        request to its arrived rows, so the padding is counted whenever it
+        may apply.
+        """
         decode_exact = 0
         for request_id in decode_ids:
             request = self.requests[request_id]
@@ -150,12 +163,22 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 continue
             if self.current_step < request.next_decode_eligible_step:
                 continue
+            consumption = (
+                request.num_tokens_with_spec
+                + placeholders
+                - request.num_computed_tokens
+            )
+            if (
+                consumption == 1
+                and self.num_spec_tokens > 0
+                and self.num_sampled_tokens_per_step > 0
+                and self.dynamic_sd_lookup is None
+            ):
+                consumption += self.num_spec_tokens
             decode_exact += max(
                 0,
                 min(
-                    request.num_tokens_with_spec
-                    + placeholders
-                    - request.num_computed_tokens,
+                    consumption,
                     self.max_model_len
                     - self.num_sampled_tokens_per_step
                     - request.num_computed_tokens,

@@ -87,6 +87,7 @@ def _request(
         num_output_placeholders=0,
         num_preemptions=preemptions,
         next_decode_eligible_step=0,
+        max_tokens=20,
         is_prefill_chunk=computed < prompt,
         block_hashes=[],
         skip_reading_prefix_cache=skip,
@@ -127,6 +128,10 @@ def _scheduler(request: _Request) -> LwdCloudScheduler:
     scheduler._lwd_refill_pending = {}
     scheduler._lwd_prefill_group_cursor = 0
     scheduler.current_step = 0
+    scheduler.num_spec_tokens = 0
+    scheduler.num_sampled_tokens_per_step = 1
+    scheduler.max_model_len = 100
+    scheduler.dynamic_sd_lookup = None
     scheduler.lwd_prefix_hits = {}
     scheduler.lwd_finished_records = {}
     return scheduler
@@ -148,6 +153,33 @@ def test_decode_requests_include_all_native_waiting_queues() -> None:
         "waiting",
         "kv-holding",
     ]
+
+
+def test_decode_consumption_counts_spec_padding_of_new_decodes() -> None:
+    """The mirror must never undercount native: a 1-token decode admission
+    is padded to 1 + num_spec_tokens by native's waiting path, and the
+    missing padding shrinks the dispatch budget cap, cutting the freshly
+    dispatched prefill window and starving its tail chunk to zero across
+    consecutive steps (field form: want=2/24 got=0)."""
+    request = _request("d", prompt=10, computed=10)
+    request.num_tokens_with_spec = 11  # one row awaiting its first decode
+    scheduler = _scheduler(request)
+    scheduler.num_spec_tokens = 1
+
+    assert scheduler._lwd_compute_decode_consumption(["d"]) == 2
+
+    # Steady decode rows (already carrying a draft slot) stay as-is.
+    request.num_tokens_with_spec = 12
+    assert scheduler._lwd_compute_decode_consumption(["d"]) == 2
+
+
+def test_decode_consumption_counts_no_padding_without_spec() -> None:
+    request = _request("d", prompt=10, computed=10)
+    request.num_tokens_with_spec = 11
+    scheduler = _scheduler(request)
+    scheduler.num_spec_tokens = 0
+
+    assert scheduler._lwd_compute_decode_consumption(["d"]) == 1
 
 
 def _prefix_scheduler(
