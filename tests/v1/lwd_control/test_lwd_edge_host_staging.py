@@ -33,9 +33,6 @@ def _scheduler() -> LwdEdgeScheduler:
     }
     scheduler._lwd_aborted_req_ids = {DP0: [], DP1: []}
     scheduler._lwd_route = {}
-    scheduler.running = []
-    scheduler.waiting = []
-    scheduler.kv_holding_waiting = []
     scheduler.lwd_model_family = object.__new__(LwdMropeModelFamily)
     scheduler.lwd_model_family._positions = {}
     scheduler._lwd_pending_refills = ()
@@ -58,12 +55,10 @@ def test_placeholder_output_consumes_only_addressed_dp_watermark() -> None:
     assert scheduler._lwd_accounts[DP1].pending_chunks() == 1
 
 
-def test_pending_up_send_keeps_steps_alive_while_prefill_work_waits() -> None:
+def test_pending_up_send_keeps_empty_steps_alive_until_watermark_arrives() -> None:
     scheduler = _scheduler()
     account = scheduler._lwd_accounts[DP0]
     account.register_batch(0, {"a"})
-    scheduler._lwd_route["w1"] = DP0
-    scheduler.waiting = [SimpleNamespace(request_id="w1")]
     scheduler._lwd_embed_dispatchable = lambda: False
 
     assert scheduler.has_requests()
@@ -76,14 +71,6 @@ def test_pending_up_send_keeps_steps_alive_while_prefill_work_waits() -> None:
     )
 
     assert account.pending_chunks() == 0
-    assert not scheduler.has_requests()
-
-
-def test_pending_up_send_without_prefill_work_parks_until_next_c2e() -> None:
-    scheduler = _scheduler()
-    scheduler._lwd_accounts[DP0].register_batch(0, {"a"})
-    scheduler._lwd_embed_dispatchable = lambda: False
-
     assert not scheduler.has_requests()
 
 
